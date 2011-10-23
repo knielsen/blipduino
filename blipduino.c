@@ -23,47 +23,40 @@
 #include <arduino/timer2.h>
 #include <arduino/adc.h>
 
+#include "onewire.c"
+
 #define BOUND_LOW 250
 #define BOUND_HIGH 350
 
 static volatile uint8_t new_value;
 
 static volatile struct {
-	char *str;
-	uint8_t printing;
-} output;
+	uint8_t buf[240];
+	uint8_t start;
+	uint8_t end;
+} serial_output;
 
 serial_interrupt_dre()
 {
-	char *str = output.str;
-	uint8_t c = *str;
+	uint8_t start = serial_output.start;
 
-	if (c == '\0') {
+	if (start == serial_output.end)
 		serial_interrupt_dre_disable();
-		output.printing = 0;
-	} else {
-		serial_write(c);
-		output.str = str + 1;
+	else {
+		serial_write(serial_output.buf[start]);
+		serial_output.start = (start + 1) % sizeof(serial_output.buf);
 	}
 }
 
 static void
-serial_puts(char *str)
+serial_puts(const char *str)
 {
-again:
-	cli();
-	if (output.printing) {
-		sleep_enable();
-		sei();
-		sleep_cpu();
-		sleep_disable();
-		goto again;
-	}
-	sei();
+	uint8_t end = serial_output.end;
 
-	output.str = str;
-	output.printing = 1;
+	while ((serial_output.buf[end] = *str++))
+		end = (end + 1) % sizeof(serial_output.buf);
 
+	serial_output.end = end;
 	serial_interrupt_dre_enable();
 }
 
@@ -122,6 +115,8 @@ main(void)
 	timer2_compare_a_set(124);
 	timer2_interrupt_a_enable();
 
+	ow_timer_init();
+
 	adc_reference_internal_5v();
 	adc_pin_select(5);
 	adc_clock_d128();
@@ -131,11 +126,13 @@ main(void)
 	adc_enable();
 
 	sei();
+	start_temp_measure();
+
 	while (1) {
 		uint16_t value;
 
 		cli();
-		if (!new_value) {
+		if (!new_value && !ev_timer) {
 			sleep_enable();
 			sei();
 			sleep_cpu();
@@ -144,30 +141,39 @@ main(void)
 		}
 		sei();
 
-		value = adc_data();
-		new_value = 0;
+		if (new_value) {
+			value = adc_data();
+			new_value = 0;
 
-		if (state && value < BOUND_LOW) {
-			uint16_t now = time;
-			char *p;
+			if (state && value < BOUND_LOW) {
+				uint16_t now = time;
+				char *p, *q;
 
-			timer2_clock_reset();
-			time = 0;
+				timer2_clock_reset();
+				time = 0;
 
-			pin13_low();
+				pin13_low();
 
-			p = sprint_uint16_b10(buf, now);
-			*p++ = '\n';
-			*p = '\0';
-			serial_puts(buf);
+				p = sprint_uint16_b10(buf, now);
+				*p++ = ' ';
+				q= last_temp_buf;
+				while (*q)
+					*p++ = *q++;
+				*p++ = '\n';
+				*p = '\0';
+				serial_puts(buf);
 
-			state = 0;
-			continue;
+				state = 0;
+				continue;
+			}
+
+			if (value > BOUND_HIGH) {
+				pin13_high();
+				state = 1;
+			}
 		}
 
-		if (value > BOUND_HIGH) {
-			pin13_high();
-			state = 1;
-		}
+		if (ev_timer)
+			handle_timer();
 	}
 }
